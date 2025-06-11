@@ -28,10 +28,11 @@ import requests
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
-
 import ssl
 import certifi
 import urllib.request
+import openai
+from urllib.parse import urlparse
 
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 urllib.request.urlopen("https://slack.com", context=ssl_context)
@@ -40,6 +41,10 @@ urllib.request.urlopen("https://slack.com", context=ssl_context)
 load_dotenv()
 # Initialize the Slack app
 app = App(token=os.getenv("SLACK_BOT_TOKEN"), signing_secret=os.getenv("SLACK_SIGNING_SECRET"))
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+bb_username = os.getenv("BB_USERNAME")
+bb_app_password = os.getenv("BB_APP_PASSWORD")
 
 # Load QA mapping
 with open("QA_map.json") as f:
@@ -69,11 +74,16 @@ def get_jira_ticket(ticket_id):
 ticket = get_jira_ticket("FRA-36519")
 
 def parse_ticket_info(ticket):
+    with open("some.json", "w", encoding="utf-8") as f:
+        json.dump(ticket, f, indent=2, ensure_ascii=False)
+    print(f"Ticket saved to {"some.json"}")
     fields = ticket.get("fields", {})
     assignee = fields.get("assignee", {}).get("displayName", "Not Assigned")
     reporter = fields.get("reporter", {}).get("displayName", "Not Assigned")
     labels = fields.get("labels", [])
     status = fields.get("status", {}).get("name", "Unknown")
+    description = fields.get("description", {}).get("content", [])
+    print(f"Description: {description[0]['content'][0]['attrs']['url']}")
 
     # Dev assignee = same as assignee (unless custom field exists)
     dev_assignee = assignee
@@ -105,6 +115,28 @@ def parse_ticket_info(ticket):
 
 parse_ticket_info(ticket)
 
+@app.command("/gpt")
+def handle_gpt_command(ack, respond, command):
+    ack()
+    prompt = command.get("text", "").strip()
+    if not prompt:
+        respond("❗ Please provide a prompt or question. Example: `/gpt How do I write unit tests?`")
+        return
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Or "gpt-3.5-turbo"
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant for the Fetch Rewards QA and developer team."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        answer = completion.choices[0].message.content.strip()
+        respond(f"💡 *GPT says:*\n{answer}")
+    except Exception as e:
+        print("OpenAI API error:", e)
+        respond("⚠️ There was an error contacting ChatGPT. Please try again later.")
+
 @app.command("/ticket")
 def handle_ticket_command(ack, respond, command):
     print("✅ Received /ticket command")
@@ -132,7 +164,7 @@ def handle_ticket_command(ack, respond, command):
             f"📝 Reporter: {reporter}\n"
             f"🏷️ Labels: {', '.join(labels) if labels else 'None'}\n"
             f"📌 Status: {status}\n"
-            f"🔗 View Ticket: {os.getenv('JIRA_BASE_URL')}/browse/{ticket.get('key')}"
+            f"🔗 View Ticket: {os.getenv('JIRA_BASE_URL')}/browse/{ticket.get('key')}\n"
         )
         respond(response_text)
 
@@ -296,7 +328,214 @@ def suggest_qa_command(ack, respond, command):
                 all_qa_mentions.append(f"<@{user_id}>")
         respond(f"👥 QAs in #{matched_channel}: {', '.join(all_qa_mentions) if all_qa_mentions else 'None'}")
 
+# --- Helper: Extract PR link from description ---
+def extract_pr_link_from_jira(fields):
+    desc = fields.get("description", {})
+    print(f"Description content: {desc}")
+    # if desc and isinstance(desc, dict):
+    #     for block in desc.get("content", []):
+    #         if block.get("type") == "paragraph":
+    #             for item in block.get("content", []):
+    #                 if item.get("type") == "inlineCard" and "url" in item.get("attrs", {}):
+    #                     return item["attrs"]["url"]
+    if desc['content'][0]['content'][0]['attrs']['url']:
+        return desc['content'][0]['content'][0]['attrs']['url']
+    # Optionally, try to get from a custom field (if description is missing)
+    # If you have another field, add extraction logic here.
+    return None
 
+# --- Helper: Parse Bitbucket PR URL ---
+def parse_bitbucket_pr_url(pr_url):
+    parsed = urlparse(pr_url)
+    parts = parsed.path.strip('/').split('/')
+    if len(parts) >= 4 and parts[2] == "pull-requests":
+        workspace = parts[0]
+        repo_slug = parts[1]
+        pr_id = parts[3]
+        return workspace, repo_slug, pr_id
+    return None, None, None
+
+# --- Helper: Get Bitbucket PR details and changed files ---
+def get_bitbucket_pr_details(workspace, repo_slug, pr_id, bb_username, bb_app_password):
+    pr_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}"
+    resp = requests.get(pr_url, auth=(bb_username, bb_app_password))
+    pr_data = resp.json() if resp.status_code == 200 else {}
+
+    diffstat_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}/diffstat"
+    diff_resp = requests.get(diffstat_url, auth=(bb_username, bb_app_password))
+    files = []
+    if diff_resp.status_code == 200:
+        for entry in diff_resp.json().get("values", []):
+            # 'new' is the post-change file path; fallback to 'old'
+            path = (entry.get("new") or entry.get("old") or {}).get("path")
+            if path:
+                files.append(path)
+    return pr_data, files
+
+# --- Helper: Infer module/package from file path (customize this as needed) ---
+def infer_module_from_file(filepath):
+    # Example: 'android/app/src/...', 'rewards/models.py'
+    if filepath.startswith("android/"):
+        return "Android"
+    elif filepath.startswith("rewards/"):
+        return "Rewards"
+    elif filepath.startswith("receipts/"):
+        return "Receipts"
+    else:
+        # Return the top-level folder as module name
+        return filepath.split("/")[0] if "/" in filepath else "root"
+
+# --- Slack Command: /ticket-pr-details ---
+@app.command("/pr-details")
+def ticket_pr_details_command(ack, respond, command):
+    ack()
+    ticket_id = command.get("text", "").strip()
+    if not ticket_id:
+        respond("Please provide a Jira ticket ID.")
+        return
+
+    ticket = get_jira_ticket(ticket_id)
+    if not ticket:
+        respond(f"Ticket `{ticket_id}` not found.")
+        return
+
+    fields = ticket.get("fields", {})
+
+    # --- JIRA ticket summary (from your existing code) ---
+    assignee = fields.get("assignee", {}).get("displayName", "Not Assigned")
+    reporter = fields.get("reporter", {}).get("displayName", "Not Assigned")
+    labels = fields.get("labels", [])
+    status = fields.get("status", {}).get("name", "Unknown")
+    project = fields.get("project", {}).get("name", "Unknown")
+
+    # --- PR extraction ---
+    pr_link = extract_pr_link_from_jira(fields)
+    if not pr_link:
+        respond(f"No PR link found in the Jira ticket description for `{ticket_id}`.")
+        return
+
+    workspace, repo_slug, pr_id = parse_bitbucket_pr_url(pr_link)
+    if not workspace:
+        respond("Could not parse Bitbucket PR URL.")
+        return
+
+    # --- Bitbucket details ---
+    pr_data, files = get_bitbucket_pr_details(workspace, repo_slug, pr_id, bb_username, bb_app_password)
+
+    pr_title = pr_data.get("title", "Unknown")
+    author = pr_data.get("author", {}).get("display_name", "Unknown")
+    created_on = pr_data.get("created_on", "Unknown")
+    pr_status = pr_data.get("state", "Unknown")
+    pr_web_url = pr_data.get("links", {}).get("html", {}).get("href", pr_link)
+    branch_from = pr_data.get("source", {}).get("branch", {}).get("name", "Unknown")
+    branch_to = pr_data.get("destination", {}).get("branch", {}).get("name", "Unknown")
+
+    # --- Per-file module inference ---
+    modules = set()
+    file_lines = []
+    for f in files[:15]:  # show up to 15 files
+        mod = infer_module_from_file(f)
+        modules.add(mod)
+        file_lines.append(f"• `{f}` _(module: {mod})_")
+    more_files = "\n...and more" if len(files) > 15 else ""
+    modules_line = ", ".join(sorted(modules)) if modules else "Unknown"
+
+    # --- Construct response ---
+    response = (
+        f"*Jira Ticket*: `{ticket_id}` (Project: {project})\n"
+        f"*Status*: {status} | *Labels*: {', '.join(labels) if labels else 'None'}\n"
+        f"*Assignee*: {assignee} | *Reporter*: {reporter}\n"
+        f"\n*PR Title*: {pr_title}\n"
+        f"*Author*: {author}\n"
+        f"*Created On*: {created_on}\n"
+        f"*Status*: {pr_status}\n"
+        f"*From Branch*: `{branch_from}` → *To*: `{branch_to}`\n"
+        f"*PR Link*: {pr_web_url}\n"
+        f"\n*Changed Files* ({len(files)}):\n" +
+        "\n".join(file_lines) +
+        more_files +
+        (f"\n\n*Modules/Packages affected*: {modules_line}" if modules else "")
+    )
+    respond(response)
+
+def parse_bitbucket_pr_url2(pr_url):
+    parsed = urlparse(pr_url)
+    parts = parsed.path.strip('/').split('/')
+    if len(parts) >= 4 and parts[2] == "pull-requests":
+        workspace = parts[0]
+        repo_slug = parts[1]
+        pr_id = parts[3]
+        return workspace, repo_slug, pr_id
+    return None, None, None
+
+def get_bitbucket_pr_details2(workspace, repo_slug, pr_id, bb_username, bb_app_password):
+    pr_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}"
+    resp = requests.get(pr_url, auth=(bb_username, bb_app_password))
+    pr_data = resp.json() if resp.status_code == 200 else {}
+
+    diffstat_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}/diffstat"
+    diff_resp = requests.get(diffstat_url, auth=(bb_username, bb_app_password))
+    files = []
+    if diff_resp.status_code == 200:
+        for entry in diff_resp.json().get("values", []):
+            path = (entry.get("new") or entry.get("old") or {}).get("path")
+            if path:
+                files.append(path)
+    return pr_data, files
+
+def infer_module_from_file2(filepath):
+    # Simple: use top-level folder, customize for your org as needed
+    return filepath.split("/")[0] if "/" in filepath else "root"
+
+@app.command("/pr-inspect")
+def pr_inspect_command(ack, respond, command):
+    ack()
+    pr_link = command.get("text", "").strip()
+    if not pr_link or "bitbucket.org" not in pr_link:
+        respond("Please provide a Bitbucket PR link. Example: `/pr-inspect https://bitbucket.org/your_workspace/your_repo/pull-requests/12345`")
+        return
+
+    workspace, repo_slug, pr_id = parse_bitbucket_pr_url2(pr_link)
+    if not workspace:
+        respond("Could not parse the Bitbucket PR link.")
+        return
+
+    pr_data, files = get_bitbucket_pr_details2(workspace, repo_slug, pr_id, bb_username, bb_app_password)
+
+    pr_title = pr_data.get("title", "Unknown")
+    author = pr_data.get("author", {}).get("display_name", "Unknown")
+    created_on = pr_data.get("created_on", "Unknown")
+    status = pr_data.get("state", "Unknown")
+    pr_web_url = pr_data.get("links", {}).get("html", {}).get("href", pr_link)
+    branch_from = pr_data.get("source", {}).get("branch", {}).get("name", "Unknown")
+    branch_to = pr_data.get("destination", {}).get("branch", {}).get("name", "Unknown")
+    reviewers = [r.get("display_name", "Unknown") for r in pr_data.get("reviewers", [])]
+    reviewers_line = ", ".join(reviewers) if reviewers else "None"
+
+    # Per-file module inference
+    modules = set()
+    file_lines = []
+    for f in files[:15]:  # show up to 15 files
+        mod = infer_module_from_file2(f)
+        modules.add(mod)
+        file_lines.append(f"• `{f}` _(module: {mod})_")
+    more_files = "\n...and more" if len(files) > 15 else ""
+    modules_line = ", ".join(sorted(modules)) if modules else "Unknown"
+
+    response = (
+        f"*PR Title*: {pr_title}\n"
+        f"*Author*: {author}\n"
+        f"*Status*: {status}\n"
+        f"*From Branch*: `{branch_from}` → *To*: `{branch_to}`\n"
+        f"*Reviewers*: {reviewers_line}\n"
+        f"*Created On*: {created_on}\n"
+        f"*PR Link*: {pr_web_url}\n"
+        f"\n*Changed Files* ({len(files)}):\n" +
+        "\n".join(file_lines) +
+        more_files +
+        (f"\n\n*Modules/Packages affected*: {modules_line}" if modules else "")
+    )
+    respond(response)
 
 if __name__ == "__main__":
     from slack_bolt.adapter.socket_mode import SocketModeHandler
