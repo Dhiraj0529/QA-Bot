@@ -176,13 +176,13 @@ def handle_ticket_command(ack, respond, command):
 def list_teams_command(ack, respond):
     ack()
     try:
-        # Get channels
+        # Get only top 5 QA-related channels
         channels = []
         cursor = None
         while True:
             result = app.client.conversations_list(
                 types="public_channel,private_channel",
-                limit=100,
+                limit=5,
                 cursor=cursor
             )
             channels.extend(result.get("channels", []))
@@ -190,26 +190,27 @@ def list_teams_command(ack, respond):
             if not cursor:
                 break
 
-        # Show only QA-related channels (name contains 'qa')
-        qa_channels = [ch for ch in channels if 'qa' in ch["name"]]
+        # Only process the first 5 QA channels
+        qa_channels = [ch for ch in channels if 'qa' in ch["name"]][:3]
         if not qa_channels:
             respond("No QA channels found!")
             return
 
-        response_lines = ["*QA Channels & Members:*"]
+        response_lines = ["*Top QA Channels & Members:*"]
         for ch in qa_channels:
             channel_name = ch["name"]
             channel_id = ch["id"]
 
-            # Step 3: Get members in channel
+            # Step 3: Get members in channel (limit to 10 users)
             members = []
             mem_cursor = None
             while True:
-                mem_result = app.client.conversations_members(channel=channel_id, limit=100, cursor=mem_cursor)
+                mem_result = app.client.conversations_members(channel=channel_id, limit=10, cursor=mem_cursor)
                 members.extend(mem_result.get("members", []))
                 mem_cursor = mem_result.get("response_metadata", {}).get("next_cursor")
-                if not mem_cursor:
+                if not mem_cursor or len(members) >= 10:
                     break
+            members = members[:5]  # show only top 10 users
 
             # Step 4: Fetch user details for each member
             user_details = []
@@ -219,7 +220,6 @@ def list_teams_command(ack, respond):
                     profile = user_info["user"]["profile"]
                     real_name = profile.get("real_name", "Unknown")
                     display_name = profile.get("display_name", "Unknown")
-                    email = profile.get("email", "Unknown")
                     title = profile.get("title", "")
                     user_details.append(
                         f"<@{user_id}> (`{display_name}` / {real_name}{' - ' + title if title else ''})"
@@ -228,12 +228,8 @@ def list_teams_command(ack, respond):
             users_line = ", ".join(user_details) if user_details else "_No members found_"
             response_lines.append(f"\n*#{channel_name}*:\n{users_line}")
 
-        # Step 5: Send message (limit output size for Slack)
         response_text = "\n".join(response_lines)
-        if len(response_text) > 2500:
-            respond("Too many users/channels to display. Please narrow your search.")
-        else:
-            respond(response_text)
+        respond(response_text)
 
     except Exception as e:
         print("Error in /list-teams:", e)
@@ -258,9 +254,9 @@ def suggest_qa_command(ack, respond, command):
 
     # Map known label → QA channel (customize as needed)
     label_to_channel = {
-        "android-guild": "lakitu-qa",    # Example: 'android-guild' label -> 'lakitu-qa' channel
-        "lakitu": "lakitu-qa",
-        "android": "lakitu-qa",
+        "android-guild": "pack-lakitu-qa",    # Example: 'android-guild' label -> 'lakitu-qa' channel
+        "lakitu": "pack-lakitu-qa",
+        "android": "pack-lakitu-qa",
     }
 
     # Find first matching label-channel
@@ -536,6 +532,107 @@ def pr_inspect_command(ack, respond, command):
         (f"\n\n*Modules/Packages affected*: {modules_line}" if modules else "")
     )
     respond(response)
+
+@app.command("/suggest-qa-pr")
+def suggest_qa_pr_command(ack, respond, command):
+    ack()
+    pr_link = command.get("text", "").strip()
+    if not pr_link or "bitbucket.org" not in pr_link:
+        respond("Please provide a Bitbucket PR link. Example: `/suggest-qa-pr https://bitbucket.org/your_workspace/your_repo/pull-requests/12345`")
+        return
+
+    workspace, repo_slug, pr_id = parse_bitbucket_pr_url2(pr_link)
+    if not workspace:
+        respond("Could not parse the Bitbucket PR link.")
+        return
+
+    pr_data, files = get_bitbucket_pr_details2(workspace, repo_slug, pr_id, bb_username, bb_app_password)
+
+    pr_title = pr_data.get("title", "Unknown")
+    author = pr_data.get("author", {}).get("display_name", "Unknown")
+    created_on = pr_data.get("created_on", "Unknown")
+    status = pr_data.get("state", "Unknown")
+    pr_web_url = pr_data.get("links", {}).get("html", {}).get("href", pr_link)
+    branch_from = pr_data.get("source", {}).get("branch", {}).get("name", "Unknown")
+    branch_to = pr_data.get("destination", {}).get("branch", {}).get("name", "Unknown")
+    reviewers = [r.get("display_name", "Unknown") for r in pr_data.get("reviewers", [])]
+    reviewers_line = ", ".join(reviewers) if reviewers else "None"
+
+    # Changed files and modules
+    modules = set()
+    file_lines = []
+    for f in files[:15]:  # Show up to 15 files
+        mod = infer_module_from_file2(f)
+        modules.add(mod)
+        file_lines.append(f"• `{f}` _(module: {mod})_")
+    more_files = "\n...and more" if len(files) > 15 else ""
+    modules_line = ", ".join(sorted(modules)) if modules else "Unknown"
+
+    # Module to channel mapping (customize as needed)
+    module_to_channel = {
+        "android": "lakitu-qa",
+        "auth": "eluminati-qa",
+        "app": "eluminati-qa",
+        "lakitu": "lakitu-qa",
+        'android-guild': 'lakitu-qa',
+        # Add more mappings as needed
+    }
+    general_qa_channel = "lakitu-qa"  # Fallback
+
+    # Suggest QAs for each module/channel
+    channel_suggestions = []
+    channels = app.client.conversations_list(types="public_channel,private_channel").get("channels", [])
+    for module in modules:
+        matched_channel = module_to_channel.get(module.lower(), general_qa_channel)
+        channel_obj = next((ch for ch in channels if ch["name"] == matched_channel), None)
+        if not channel_obj:
+            channel_suggestions.append(f"*{module}*: No channel named `{matched_channel}` found.")
+            continue
+        channel_id = channel_obj["id"]
+
+        # Get members
+        members = []
+        cursor = None
+        while True:
+            mem_result = app.client.conversations_members(channel=channel_id, limit=100, cursor=cursor)
+            members.extend(mem_result.get("members", []))
+            cursor = mem_result.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        # Find QAs who are active and have QA in their title/display name
+        qa_mentions = []
+        for user_id in members:
+            user_info = app.client.users_info(user=user_id)
+            profile = user_info["user"]["profile"]
+            is_qa = "qa" in (profile.get("title", "") + profile.get("real_name", "") + profile.get("display_name", "")).lower()
+            presence = app.client.users_getPresence(user=user_id)
+            if is_qa and presence.get("presence") == "active":
+                qa_mentions.append(f"<@{user_id}>")
+
+        if qa_mentions:
+            channel_suggestions.append(f"*{module}* (`#{matched_channel}`): {', '.join(qa_mentions)}")
+        else:
+            channel_suggestions.append(f"*{module}* (`#{matched_channel}`): _No active QAs found_")
+
+    # Construct final response
+    response = (
+        f"*PR Title*: {pr_title}\n"
+        f"*Author*: {author}\n"
+        f"*Status*: {status}\n"
+        f"*From Branch*: `{branch_from}` → *To*: `{branch_to}`\n"
+        f"*Reviewers*: {reviewers_line}\n"
+        f"*Created On*: {created_on}\n"
+        f"*PR Link*: {pr_web_url}\n"
+        f"\n*Changed Files* ({len(files)}):\n" +
+        "\n".join(file_lines) +
+        more_files +
+        (f"\n\n*Modules/Packages affected*: {modules_line}" if modules else "") +
+        "\n\n*Suggested Active QAs:*\n" +
+        "\n".join(channel_suggestions)
+    )
+    respond(response)
+
 
 if __name__ == "__main__":
     from slack_bolt.adapter.socket_mode import SocketModeHandler
