@@ -78,7 +78,6 @@ def parse_ticket_info(ticket):
         json.dump(ticket, f, indent=2, ensure_ascii=False)
     print(f"Ticket saved to {"some.json"}")
     fields = ticket.get("fields", {})
-    print(f"Fields: {fields}")
     assignee = (fields.get("assignee") or {}).get("displayName", "Not Assigned")
     reporter = (fields.get("reporter") or {}).get("displayName", "Not Assigned")
     labels = fields.get("labels") or []
